@@ -27,13 +27,12 @@ export default function Dashboard() {
         .from('training_metrics')
         .select('*')
         .order('created_at', { ascending: true })
-        .limit(5000);
+        .limit(10000);
       
       if (metrics) setData(metrics);
     };
 
     fetchData();
-    // Refresh the graph every 10 seconds
     const interval = setInterval(fetchData, 10000);
     return () => clearInterval(interval);
   }, []);
@@ -47,7 +46,7 @@ export default function Dashboard() {
     return acc;
   }, {} as Record<number, MetricRow[]>);
 
-  // 2. Extract and sort the phase numbers so they render in order (e.g., Phase 1, Phase 2)
+  // 2. Extract and sort the phase numbers so they render in order
   const phases = Object.keys(groupedData).map(Number).sort((a, b) => a - b);
 
   return (
@@ -60,7 +59,6 @@ export default function Dashboard() {
       <h1 className="text-2xl font-bold mb-2 text-green-400">Manny Telemetry</h1>
       <p className="text-gray-400 mb-8 text-sm">Live Multimodal Fusion Tracking</p>
 
-      {/* 3. Dynamically map through the phases and generate a separate chart for each */}
       <div className="space-y-8">
         {phases.length === 0 ? (
           <p className="text-gray-500 italic">Waiting for telemetry data...</p>
@@ -70,7 +68,6 @@ export default function Dashboard() {
               key={phase}
               initial={{ opacity: 0, x: -20 }}
               animate={{ opacity: 1, x: 0 }}
-              // Stagger the animation slightly for each subsequent chart
               transition={{ duration: 0.5, delay: index * 0.1 }}
               className="bg-gray-900 rounded-xl p-4 shadow-lg border border-gray-800"
             >
@@ -79,7 +76,17 @@ export default function Dashboard() {
                 <ResponsiveContainer width="100%" height="100%">
                   <LineChart data={groupedData[phase]}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#333" />
-                    <XAxis dataKey="step" stroke="#888" fontSize={12} tickFormatter={(tick) => `${(tick/1000).toFixed(1)}k`} />
+                    
+                    {/* AUTOMATIC SCALING: This forces the graph to start at the exact step count (e.g., 805k) */}
+                    <XAxis 
+                      type="number"
+                      dataKey="step" 
+                      domain={['dataMin', 'dataMax']}
+                      stroke="#888" 
+                      fontSize={12} 
+                      tickFormatter={(tick) => `${(tick/1000).toFixed(1)}k`} 
+                    />
+                    
                     <YAxis yAxisId="left" stroke="#4ade80" fontSize={12} domain={[0, 100]} />
                     <YAxis yAxisId="right" orientation="right" stroke="#f472b6" fontSize={12} domain={[0, 1]} />
                     <Tooltip contentStyle={{ backgroundColor: '#111', borderColor: '#333' }} />
