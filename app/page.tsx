@@ -26,10 +26,13 @@ export default function Dashboard() {
       const { data: metrics } = await supabase
         .from('training_metrics')
         .select('*')
-        .order('created_at', { ascending: true })
+        .order('created_at', { ascending: false }) // <-- FIX: Grabs the absolute newest data first!
         .limit(10000);
       
-      if (metrics) setData(metrics);
+      if (metrics) {
+        // <-- FIX: Reverses the array so the chart reads perfectly left-to-right
+        setData(metrics.reverse()); 
+      }
     };
 
     fetchData();
@@ -38,6 +41,7 @@ export default function Dashboard() {
   }, []);
 
   // 1. Group the flat data array by the 'phase' property
+  // This automatically creates a new graph category every time the box changes position!
   const groupedData = data.reduce((acc, row) => {
     if (!acc[row.phase]) {
       acc[row.phase] = [];
@@ -77,7 +81,7 @@ export default function Dashboard() {
                   <LineChart data={groupedData[phase]}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#333" />
                     
-                    {/* AUTOMATIC SCALING: This forces the graph to start at the exact step count (e.g., 805k) */}
+                    {/* AUTOMATIC SCALING: Forces the graph to start at the exact step count (e.g., 849k) */}
                     <XAxis 
                       type="number"
                       dataKey="step" 
