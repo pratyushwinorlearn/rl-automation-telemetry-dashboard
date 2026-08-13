@@ -27,7 +27,7 @@ export default function Dashboard() {
         .from('training_metrics')
         .select('*')
         .order('created_at', { ascending: true })
-        .limit(100);
+        .limit(5000);
       
       if (metrics) setData(metrics);
     };
