@@ -1,7 +1,17 @@
 "use client";
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useMemo } from 'react';
 import { createClient } from '@supabase/supabase-js';
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
+import {
+  LineChart,
+  Line,
+  AreaChart,
+  Area,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  ResponsiveContainer,
+} from 'recharts';
 import { motion } from 'framer-motion';
 
 const supabase = createClient(
@@ -18,20 +28,238 @@ interface MetricRow {
   created_at?: string;
 }
 
+interface PhaseDiagnostics {
+  phase: number;
+  rawRows: MetricRow[];
+  cleanRows: MetricRow[];
+  startStep: number;
+  endStep: number;
+  totalStepsInPhase: number;
+  activeTimeFormatted: string;
+  activeMinutes: number;
+  peakWinRate: number;
+  peakWinStep: number;
+  finalWinRate: number;
+  avgWinRate: number;
+  avgLoss: number;
+  maxLoss: number;
+  maxLossStep: number;
+  startEpsilon: number;
+  endEpsilon: number;
+  adrenalineSpikes: { step: number; from: number; to: number }[];
+  rewireRetries: number;
+  narrative: string;
+}
+
+// ============================================================
+// HELPER 1: SMART ACTIVE TRAINING TIME CALCULATOR
+// Ignores gaps > 10 minutes (when training was stopped/paused)
+// ============================================================
+function calculateActiveTime(rows: MetricRow[]): { formatted: string; minutes: number } {
+  const timestamps = rows
+    .map((r) => (r.created_at ? new Date(r.created_at).getTime() : NaN))
+    .filter((t) => !isNaN(t))
+    .sort((a, b) => a - b);
+
+  if (timestamps.length < 2) {
+    return { formatted: "< 1m", minutes: 0 };
+  }
+
+  const MAX_GAP_MS = 10 * 60 * 1000; // 10 minutes max between active telemetry pings
+  let activeMs = 0;
+
+  for (let i = 1; i < timestamps.length; i++) {
+    const delta = timestamps[i] - timestamps[i - 1];
+    if (delta > 0 && delta <= MAX_GAP_MS) {
+      activeMs += delta;
+    }
+  }
+
+  const totalMinutes = Math.max(1, Math.round(activeMs / 60000));
+  const hours = Math.floor(totalMinutes / 60);
+  const mins = totalMinutes % 60;
+
+  if (hours > 0) {
+    return { formatted: `${hours}h ${mins}m`, minutes: totalMinutes };
+  }
+  return { formatted: `${mins}m`, minutes: totalMinutes };
+}
+
+// ============================================================
+// HELPER 2: UNTANGLE OVERLAPPING CHECKPOINT RETRIES
+// Removes backward step loops so X-axis flows cleanly left-to-right
+// ============================================================
+function cleanPhaseTrajectory(rows: MetricRow[]): {
+  cleaned: MetricRow[];
+  retriesRemoved: number;
+} {
+  if (rows.length === 0) return { cleaned: [], retriesRemoved: 0 };
+
+  // Filter out accidental step=0 reset glitches in late phases
+  const sortedSteps = [...rows].map((r) => r.step).sort((a, b) => a - b);
+  const medianStep = sortedSteps[Math.floor(sortedSteps.length / 2)] || 0;
+  const filteredGlitches =
+    medianStep > 100_000 ? rows.filter((r) => r.step > 10_000) : rows;
+
+  // Walk backward from the latest row to keep only the canonical forward trajectory
+  const keptReverse: MetricRow[] = [];
+  let minStepSeen = Infinity;
+  let retriesRemoved = 0;
+
+  for (let i = filteredGlitches.length - 1; i >= 0; i--) {
+    const row = filteredGlitches[i];
+    if (row.step < minStepSeen) {
+      keptReverse.push(row);
+      minStepSeen = row.step;
+    } else {
+      retriesRemoved++;
+    }
+  }
+
+  return {
+    cleaned: keptReverse.reverse(),
+    retriesRemoved,
+  };
+}
+
+// ============================================================
+// HELPER 3: GENERATE WRITTEN PHASE INTELLIGENCE LOG
+// ============================================================
+function buildPhaseDiagnostics(phase: number, rawRows: MetricRow[]): PhaseDiagnostics {
+  const { cleaned, retriesRemoved } = cleanPhaseTrajectory(rawRows);
+  const targetRows = cleaned.length > 5 ? cleaned : rawRows;
+
+  const startStep = targetRows[0]?.step ?? 0;
+  const endStep = targetRows[targetRows.length - 1]?.step ?? 0;
+  const totalStepsInPhase = Math.max(0, endStep - startStep);
+
+  const { formatted: activeTimeFormatted, minutes: activeMinutes } =
+    calculateActiveTime(rawRows);
+
+  let peakWinRate = 0;
+  let peakWinStep = startStep;
+  let maxLoss = 0;
+  let maxLossStep = startStep;
+  let winSum = 0;
+  let lossSum = 0;
+
+  const adrenalineSpikes: { step: number; from: number; to: number }[] = [];
+
+  for (let i = 0; i < targetRows.length; i++) {
+    const r = targetRows[i];
+    winSum += r.win_rate;
+    lossSum += r.loss;
+
+    if (r.win_rate >= peakWinRate) {
+      peakWinRate = r.win_rate;
+      peakWinStep = r.step;
+    }
+    if (r.loss > maxLoss) {
+      maxLoss = r.loss;
+      maxLossStep = r.step;
+    }
+
+    // Detect manual Epsilon bumps ("Adrenaline Spikes")
+    if (i > 0) {
+      const prevEps = targetRows[i - 1].epsilon;
+      if (r.epsilon - prevEps >= 0.08) {
+        adrenalineSpikes.push({
+          step: r.step,
+          from: prevEps,
+          to: r.epsilon,
+        });
+      }
+    }
+  }
+
+  const count = Math.max(1, targetRows.length);
+  const avgWinRate = Number((winSum / count).toFixed(1));
+  const avgLoss = Number((lossSum / count).toFixed(4));
+  const finalWinRate = targetRows[targetRows.length - 1]?.win_rate ?? 0;
+  const startEpsilon = targetRows[0]?.epsilon ?? 1.0;
+  const endEpsilon = targetRows[targetRows.length - 1]?.epsilon ?? 0.05;
+
+  // Build plain-English written analysis
+  const spanStr = `${(startStep / 1000).toFixed(1)}k to ${(endStep / 1000).toFixed(1)}k steps (+${(
+    totalStepsInPhase / 1000
+  ).toFixed(1)}k steps)`;
+
+  let spikeText =
+    adrenalineSpikes.length > 0
+      ? `Injected ${adrenalineSpikes.length} manual Adrenaline Spike${
+          adrenalineSpikes.length > 1 ? "s" : ""
+        } (Epsilon resets up to ${(
+          Math.max(...adrenalineSpikes.map((s) => s.to)) * 100
+        ).toFixed(0)}%) to break Manny out of shadow-freezing and force exploration around new pillar/guard timings.`
+      : `Epsilon decayed smoothly from ${(startEpsilon * 100).toFixed(1)}% down to ${(
+          endEpsilon * 100
+        ).toFixed(1)}% without requiring manual exploration overrides.`;
+
+  let statusText = "";
+  if (peakWinRate >= 85 && finalWinRate >= 65) {
+    statusText = `Manny mastered this waypoint layout, peaking at a ${peakWinRate.toFixed(
+      1
+    )}% win rate at step ${(peakWinStep / 1000).toFixed(1)}k and stabilizing at ${finalWinRate.toFixed(
+      1
+    )}%.`;
+  } else if (peakWinRate >= 75 && finalWinRate < 60) {
+    statusText = `Manny reached a high of ${peakWinRate.toFixed(
+      1
+    )}% at step ${(peakWinStep / 1000).toFixed(
+      1
+    )}k, followed by a late-phase dip to ${finalWinRate.toFixed(
+      1
+    )}% after a layout/curriculum adjustment forced policy rewiring.`;
+  } else {
+    statusText = `High-difficulty obstacle zone: peaked at ${peakWinRate.toFixed(
+      1
+    )}% (step ${(peakWinStep / 1000).toFixed(1)}k) and finished at ${finalWinRate.toFixed(1)}%.`;
+  }
+
+  const narrative = `Trained across ${spanStr} over ${activeTimeFormatted} of active compute. ${statusText} ${spikeText} Neural network gradients peaked at a Huber Loss of ${maxLoss.toFixed(
+    3
+  )} around step ${(maxLossStep / 1000).toFixed(1)}k during spatial adaptation.`;
+
+  return {
+    phase,
+    rawRows,
+    cleanRows: targetRows,
+    startStep,
+    endStep,
+    totalStepsInPhase,
+    activeTimeFormatted,
+    activeMinutes,
+    peakWinRate,
+    peakWinStep,
+    finalWinRate,
+    avgWinRate,
+    avgLoss,
+    maxLoss,
+    maxLossStep,
+    startEpsilon,
+    endEpsilon,
+    adrenalineSpikes,
+    rewireRetries: retriesRemoved,
+    narrative,
+  };
+}
+
 export default function Dashboard() {
   const [data, setData] = useState<MetricRow[]>([]);
+  const [cleanMode, setCleanMode] = useState<boolean>(true);
+  const [lastUpdated, setLastUpdated] = useState<string>("");
 
   useEffect(() => {
     const fetchData = async () => {
       const { data: metrics } = await supabase
         .from('training_metrics')
         .select('*')
-        .order('created_at', { ascending: false }) // <-- FIX: Grabs the absolute newest data first!
+        .order('created_at', { ascending: false })
         .limit(10000);
-      
+
       if (metrics) {
-        // <-- FIX: Reverses the array so the chart reads perfectly left-to-right
-        setData(metrics.reverse()); 
+        setData(metrics.reverse());
+        setLastUpdated(new Date().toLocaleTimeString());
       }
     };
 
@@ -40,69 +268,397 @@ export default function Dashboard() {
     return () => clearInterval(interval);
   }, []);
 
-  // 1. Group the flat data array by the 'phase' property
-  // This automatically creates a new graph category every time the box changes position!
-  const groupedData = data.reduce((acc, row) => {
-    if (!acc[row.phase]) {
-      acc[row.phase] = [];
-    }
-    acc[row.phase].push(row);
-    return acc;
-  }, {} as Record<number, MetricRow[]>);
+  // Compute global and per-phase diagnostics
+  const { phaseDiagnostics, globalStats } = useMemo(() => {
+    const grouped = data.reduce((acc, row) => {
+      if (!acc[row.phase]) acc[row.phase] = [];
+      acc[row.phase].push(row);
+      return acc;
+    }, {} as Record<number, MetricRow[]>);
 
-  // 2. Extract and sort the phase numbers so they render in order
-  const phases = Object.keys(groupedData).map(Number).sort((a, b) => a - b);
+    const sortedPhaseNums = Object.keys(grouped)
+      .map(Number)
+      .sort((a, b) => a - b);
+
+    const diagnostics = sortedPhaseNums.map((p) =>
+      buildPhaseDiagnostics(p, grouped[p])
+    );
+
+    const totalSteps = data.length > 0 ? Math.max(...data.map((r) => r.step)) : 0;
+    const allTimePeakWin =
+      data.length > 0 ? Math.max(...data.map((r) => r.win_rate)) : 0;
+    const latestRow = data[data.length - 1];
+    const totalActive = calculateActiveTime(data);
+
+    return {
+      phaseDiagnostics: diagnostics,
+      globalStats: {
+        totalSteps,
+        allTimePeakWin,
+        currentWinRate: latestRow?.win_rate ?? 0,
+        currentEpsilon: latestRow?.epsilon ?? 0,
+        currentLoss: latestRow?.loss ?? 0,
+        currentPhase: latestRow?.phase ?? 1,
+        totalActiveTime: totalActive.formatted,
+        totalCheckpoints: data.length,
+      },
+    };
+  }, [data]);
 
   return (
-    <motion.div 
-      initial={{ opacity: 0, y: 20 }}
+    <motion.div
+      initial={{ opacity: 0, y: 15 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.8 }}
-      className="min-h-screen bg-gray-950 text-white p-4 font-sans"
+      transition={{ duration: 0.6 }}
+      className="min-h-screen bg-black text-zinc-100 p-4 md:p-8 font-sans selection:bg-emerald-500/30"
     >
-      <h1 className="text-2xl font-bold mb-2 text-green-400">Manny Telemetry</h1>
-      <p className="text-gray-400 mb-8 text-sm">Live Multimodal Fusion Tracking</p>
+      <div className="max-w-7xl mx-auto space-y-8">
+        {/* ============================================================ */}
+        {/* 1. HEADER & CONTROLS                                         */}
+        {/* ============================================================ */}
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-zinc-900 pb-6">
+          <div>
+            <div className="flex items-center gap-3">
+              <span className="h-3 w-3 rounded-full bg-emerald-400 animate-pulse shadow-[0_0_12px_#34d399]" />
+              <h1 className="text-2xl md:text-3xl font-bold tracking-tight text-emerald-400">
+                Manny Telemetry
+              </h1>
+              <span className="text-xs font-mono uppercase px-2.5 py-0.5 rounded-full bg-zinc-900 border border-zinc-800 text-zinc-400">
+                UE5 + PyTorch DQN
+              </span>
+            </div>
+            <p className="text-zinc-400 mt-1 text-sm">
+              Multimodal Sensor Fusion (4-Frame CNN + 80-Ray LiDAR) • Curriculum Stealth Agent
+            </p>
+          </div>
 
-      <div className="space-y-8">
-        {phases.length === 0 ? (
-          <p className="text-gray-500 italic">Waiting for telemetry data...</p>
-        ) : (
-          phases.map((phase, index) => (
-            <motion.div 
-              key={phase}
-              initial={{ opacity: 0, x: -20 }}
-              animate={{ opacity: 1, x: 0 }}
-              transition={{ duration: 0.5, delay: index * 0.1 }}
-              className="bg-gray-900 rounded-xl p-4 shadow-lg border border-gray-800"
+          <div className="flex flex-wrap items-center gap-3">
+            <button
+              onClick={() => setCleanMode(!cleanMode)}
+              className={`px-3.5 py-2 rounded-lg text-xs font-medium border transition-all ${
+                cleanMode
+                  ? "bg-emerald-950/60 border-emerald-500/40 text-emerald-300"
+                  : "bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-zinc-200"
+              }`}
             >
-              <h2 className="text-lg font-semibold mb-4 text-blue-400">Phase {phase} Performance</h2>
-              <div className="h-64 w-full">
-                <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={groupedData[phase]}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#333" />
-                    
-                    {/* AUTOMATIC SCALING: Forces the graph to start at the exact step count (e.g., 849k) */}
-                    <XAxis 
-                      type="number"
-                      dataKey="step" 
-                      domain={['dataMin', 'dataMax']}
-                      stroke="#888" 
-                      fontSize={12} 
-                      tickFormatter={(tick) => `${(tick/1000).toFixed(1)}k`} 
-                    />
-                    
-                    <YAxis yAxisId="left" stroke="#4ade80" fontSize={12} domain={[0, 100]} />
-                    <YAxis yAxisId="right" orientation="right" stroke="#f472b6" fontSize={12} domain={[0, 1]} />
-                    <Tooltip contentStyle={{ backgroundColor: '#111', borderColor: '#333' }} />
-                    
-                    <Line yAxisId="left" type="monotone" dataKey="win_rate" stroke="#4ade80" strokeWidth={3} dot={false} name="Win Rate (%)" />
-                    <Line yAxisId="right" type="monotone" dataKey="epsilon" stroke="#f472b6" strokeWidth={2} dot={false} name="Epsilon" />
-                  </LineChart>
-                </ResponsiveContainer>
-              </div>
-            </motion.div>
-          ))
-        )}
+              {cleanMode ? "✨ Graph Mode: Untangled (Clean)" : "📈 Graph Mode: Raw Chronological"}
+            </button>
+
+            {lastUpdated && (
+              <span className="text-xs text-zinc-500 font-mono">
+                Synced: {lastUpdated}
+              </span>
+            )}
+          </div>
+        </div>
+
+        {/* ============================================================ */}
+        {/* 2. GLOBAL KPI BENTO GRID                                     */}
+        {/* ============================================================ */}
+        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
+          <div className="bg-zinc-950 border border-zinc-900 rounded-xl p-4">
+            <p className="text-xs text-zinc-500 uppercase font-mono">Total Steps</p>
+            <p className="text-xl md:text-2xl font-bold text-white mt-1">
+              {(globalStats.totalSteps / 1_000_000).toFixed(2)}M
+            </p>
+            <p className="text-[11px] text-zinc-500 mt-0.5">
+              {globalStats.totalSteps.toLocaleString()} frames
+            </p>
+          </div>
+
+          <div className="bg-zinc-950 border border-zinc-900 rounded-xl p-4">
+            <p className="text-xs text-zinc-500 uppercase font-mono">Active Compute</p>
+            <p className="text-xl md:text-2xl font-bold text-emerald-400 mt-1">
+              {globalStats.totalActiveTime}
+            </p>
+            <p className="text-[11px] text-zinc-500 mt-0.5">
+              Excludes offline pauses
+            </p>
+          </div>
+
+          <div className="bg-zinc-950 border border-zinc-900 rounded-xl p-4">
+            <p className="text-xs text-zinc-500 uppercase font-mono">Peak Win Rate</p>
+            <p className="text-xl md:text-2xl font-bold text-emerald-400 mt-1">
+              {globalStats.allTimePeakWin.toFixed(1)}%
+            </p>
+            <p className="text-[11px] text-zinc-500 mt-0.5">
+              100-episode rolling max
+            </p>
+          </div>
+
+          <div className="bg-zinc-950 border border-zinc-900 rounded-xl p-4">
+            <p className="text-xs text-zinc-500 uppercase font-mono">Latest Win Rate</p>
+            <p className="text-xl md:text-2xl font-bold text-white mt-1">
+              {globalStats.currentWinRate.toFixed(1)}%
+            </p>
+            <p className="text-[11px] text-zinc-500 mt-0.5">
+              Phase {globalStats.currentPhase} active
+            </p>
+          </div>
+
+          <div className="bg-zinc-950 border border-zinc-900 rounded-xl p-4">
+            <p className="text-xs text-zinc-500 uppercase font-mono">Exploration (ε)</p>
+            <p className="text-xl md:text-2xl font-bold text-pink-400 mt-1">
+              {(globalStats.currentEpsilon * 100).toFixed(1)}%
+            </p>
+            <p className="text-[11px] text-zinc-500 mt-0.5">
+              ε = {globalStats.currentEpsilon.toFixed(3)}
+            </p>
+          </div>
+
+          <div className="bg-zinc-950 border border-zinc-900 rounded-xl p-4">
+            <p className="text-xs text-zinc-500 uppercase font-mono">Huber Loss</p>
+            <p className="text-xl md:text-2xl font-bold text-sky-400 mt-1">
+              {globalStats.currentLoss.toFixed(4)}
+            </p>
+            <p className="text-[11px] text-zinc-500 mt-0.5">
+              {globalStats.totalCheckpoints.toLocaleString()} telemetry logs
+            </p>
+          </div>
+        </div>
+
+        {/* ============================================================ */}
+        {/* 3. SYSTEM ARCHITECTURE SPEC BAR                              */}
+        {/* ============================================================ */}
+        <div className="bg-zinc-950/90 border border-zinc-900 rounded-xl p-4 flex flex-wrap items-center justify-between gap-4 text-xs text-zinc-400">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-zinc-200 font-semibold">Brain Architecture:</span>
+            <span className="px-2 py-1 rounded bg-zinc-900 border border-zinc-800">
+              Head A: 3-Layer CNN (4×128×128 Grayscale Stack)
+            </span>
+            <span className="px-2 py-1 rounded bg-zinc-900 border border-zinc-800">
+              Head B: 2-Layer MLP (80 LiDAR Rays)
+            </span>
+            <span className="px-2 py-1 rounded bg-zinc-900 border border-zinc-800">
+              Fusion Core: 256-Unit Dense → 5 Discrete Actions
+            </span>
+          </div>
+          <div className="font-mono text-zinc-500">
+            Replay Buffer: 40,000 | Batch: 32 | γ: 0.99
+          </div>
+        </div>
+
+        {/* ============================================================ */}
+        {/* 4. PER-PHASE GRAPHS + WRITTEN INTELLIGENCE LOGS              */}
+        {/* ============================================================ */}
+        <div className="space-y-10">
+          {phaseDiagnostics.length === 0 ? (
+            <div className="bg-zinc-950 border border-zinc-900 rounded-xl p-12 text-center text-zinc-500 italic">
+              Waiting for telemetry data from Supabase...
+            </div>
+          ) : (
+            phaseDiagnostics.map((diag, index) => {
+              const chartData = cleanMode ? diag.cleanRows : diag.rawRows;
+
+              return (
+                <motion.div
+                  key={diag.phase}
+                  initial={{ opacity: 0, y: 20 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  transition={{ duration: 0.4, delay: index * 0.08 }}
+                  className="bg-zinc-950 rounded-2xl p-5 md:p-6 shadow-2xl border border-zinc-900 space-y-6"
+                >
+                  {/* Phase Card Header */}
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-zinc-900 pb-4">
+                    <div>
+                      <div className="flex items-center gap-3">
+                        <h2 className="text-lg md:text-xl font-bold text-blue-400">
+                          Phase {diag.phase} Performance
+                        </h2>
+                        <span className="text-xs px-2.5 py-0.5 rounded-full bg-blue-950/60 border border-blue-800/50 text-blue-300 font-mono">
+                          {(diag.startStep / 1000).toFixed(1)}k → {(diag.endStep / 1000).toFixed(1)}k steps
+                        </span>
+                      </div>
+                      <p className="text-xs text-zinc-500 mt-1">
+                        Active Time: <span className="text-zinc-300 font-medium">{diag.activeTimeFormatted}</span> •
+                        Peak Win Rate: <span className="text-emerald-400 font-medium">{diag.peakWinRate.toFixed(1)}%</span> •
+                        Adrenaline Spikes: <span className="text-pink-400 font-medium">{diag.adrenalineSpikes.length}</span>
+                      </p>
+                    </div>
+
+                    {cleanMode && diag.rewireRetries > 0 && (
+                      <span className="text-[11px] text-zinc-500 font-mono bg-zinc-900/80 px-2.5 py-1 rounded border border-zinc-800">
+                        Filtered {diag.rewireRetries} overlapped retry points
+                      </span>
+                    )}
+                  </div>
+
+                  {/* Charts Grid: Win Rate/Epsilon (Left) + Huber Loss (Right) */}
+                  <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                    {/* MAIN CHART: WIN RATE & EPSILON */}
+                    <div className="lg:col-span-2 bg-black/60 border border-zinc-900 rounded-xl p-4">
+                      <div className="flex items-center justify-between mb-3">
+                        <span className="text-xs font-semibold uppercase tracking-wider text-zinc-400">
+                          Win Rate (%) vs. Exploration Epsilon (ε)
+                        </span>
+                        <div className="flex items-center gap-4 text-xs">
+                          <span className="flex items-center gap-1.5 text-emerald-400">
+                            <span className="h-2 w-2 rounded-full bg-emerald-400" /> Win Rate
+                          </span>
+                          <span className="flex items-center gap-1.5 text-pink-400">
+                            <span className="h-2 w-2 rounded-full bg-pink-400" /> Epsilon
+                          </span>
+                        </div>
+                      </div>
+
+                      <div className="h-64 w-full">
+                        <ResponsiveContainer width="100%" height="100%">
+                          <LineChart data={chartData}>
+                            <CartesianGrid strokeDasharray="3 3" stroke="#18181b" />
+                            <XAxis
+                              type="number"
+                              dataKey="step"
+                              domain={['dataMin', 'dataMax']}
+                              stroke="#52525b"
+                              fontSize={11}
+                              tickFormatter={(tick) => `${(tick / 1000).toFixed(0)}k`}
+                            />
+                            <YAxis
+                              yAxisId="left"
+                              stroke="#4ade80"
+                              fontSize={11}
+                              domain={[0, 100]}
+                            />
+                            <YAxis
+                              yAxisId="right"
+                              orientation="right"
+                              stroke="#f472b6"
+                              fontSize={11}
+                              domain={[0, 1]}
+                            />
+                            <Tooltip
+                              contentStyle={{
+                                backgroundColor: '#09090b',
+                                borderColor: '#27272a',
+                                fontSize: '12px',
+                              }}
+                              labelFormatter={(label) =>
+                                `Step: ${Number(label).toLocaleString()}`
+                              }
+                            />
+                            <Line
+                              yAxisId="left"
+                              type="monotone"
+                              dataKey="win_rate"
+                              stroke="#4ade80"
+                              strokeWidth={2.5}
+                              dot={false}
+                              name="Win Rate (%)"
+                            />
+                            <Line
+                              yAxisId="right"
+                              type="monotone"
+                              dataKey="epsilon"
+                              stroke="#f472b6"
+                              strokeWidth={2}
+                              dot={false}
+                              name="Epsilon (ε)"
+                            />
+                          </LineChart>
+                        </ResponsiveContainer>
+                      </div>
+                    </div>
+
+                    {/* SECONDARY CHART: NEURAL NETWORK LOSS */}
+                    <div className="bg-black/60 border border-zinc-900 rounded-xl p-4">
+                      <div className="flex items-center justify-between mb-3">
+                        <span className="text-xs font-semibold uppercase tracking-wider text-zinc-400">
+                          Neural Network Huber Loss
+                        </span>
+                        <span className="text-xs text-sky-400 font-mono">
+                          Avg: {diag.avgLoss}
+                        </span>
+                      </div>
+
+                      <div className="h-64 w-full">
+                        <ResponsiveContainer width="100%" height="100%">
+                          <AreaChart data={chartData}>
+                            <CartesianGrid strokeDasharray="3 3" stroke="#18181b" />
+                            <XAxis
+                              type="number"
+                              dataKey="step"
+                              domain={['dataMin', 'dataMax']}
+                              stroke="#52525b"
+                              fontSize={11}
+                              tickFormatter={(tick) => `${(tick / 1000).toFixed(0)}k`}
+                            />
+                            <YAxis stroke="#38bdf8" fontSize={11} />
+                            <Tooltip
+                              contentStyle={{
+                                backgroundColor: '#09090b',
+                                borderColor: '#27272a',
+                                fontSize: '12px',
+                              }}
+                              labelFormatter={(label) =>
+                                `Step: ${Number(label).toLocaleString()}`
+                              }
+                            />
+                            <Area
+                              type="monotone"
+                              dataKey="loss"
+                              stroke="#38bdf8"
+                              fill="#0284c7"
+                              fillOpacity={0.2}
+                              strokeWidth={1.5}
+                              name="Huber Loss"
+                            />
+                          </AreaChart>
+                        </ResponsiveContainer>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* ============================================================ */}
+                  {/* WRITTEN ANALYSIS BELOW GRAPH ("PHASE INTELLIGENCE LOG")      */}
+                  {/* ============================================================ */}
+                  <div className="bg-zinc-900/40 border border-zinc-800/80 rounded-xl p-4 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <h3 className="text-xs font-bold uppercase tracking-wider text-emerald-400">
+                        📝 Phase {diag.phase} Written Intelligence Breakdown
+                      </h3>
+                      <span className="text-[11px] font-mono text-zinc-500">
+                        {diag.cleanRows.length} clean checkpoints analyzed
+                      </span>
+                    </div>
+
+                    {/* Auto-Generated Written Paragraph */}
+                    <p className="text-sm text-zinc-300 leading-relaxed">
+                      {diag.narrative}
+                    </p>
+
+                    {/* Structured Bullet Metrics */}
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-2 border-t border-zinc-800/60 text-xs">
+                      <div>
+                        <span className="text-zinc-500 block">Step Span</span>
+                        <span className="text-zinc-200 font-mono">
+                          +{(diag.totalStepsInPhase / 1000).toFixed(1)}k steps ({diag.activeTimeFormatted})
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-zinc-500 block">Win Rate Trajectory</span>
+                        <span className="text-zinc-200 font-mono">
+                          Peak {diag.peakWinRate.toFixed(1)}% → Final {diag.finalWinRate.toFixed(1)}%
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-zinc-500 block">Exploration Decay</span>
+                        <span className="text-zinc-200 font-mono">
+                          ε {diag.startEpsilon.toFixed(2)} → {diag.endEpsilon.toFixed(2)} ({diag.adrenalineSpikes.length} spikes)
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-zinc-500 block">Peak Gradient Rewiring</span>
+                        <span className="text-zinc-200 font-mono">
+                          Loss {diag.maxLoss.toFixed(3)} @ {(diag.maxLossStep / 1000).toFixed(1)}k
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                </motion.div>
+              );
+            })
+          )}
+        </div>
       </div>
     </motion.div>
   );
