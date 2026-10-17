@@ -65,7 +65,7 @@ function calculateActiveTime(rows: MetricRow[]): { formatted: string; minutes: n
     return { formatted: "< 1m", minutes: 0 };
   }
 
-  const MAX_GAP_MS = 10 * 60 * 1000; // 10 minutes max between active telemetry pings
+  const MAX_GAP_MS = 10 * 60 * 1000;
   let activeMs = 0;
 
   for (let i = 1; i < timestamps.length; i++) {
@@ -95,13 +95,11 @@ function cleanPhaseTrajectory(rows: MetricRow[]): {
 } {
   if (rows.length === 0) return { cleaned: [], retriesRemoved: 0 };
 
-  // Filter out accidental step=0 reset glitches in late phases
   const sortedSteps = [...rows].map((r) => r.step).sort((a, b) => a - b);
   const medianStep = sortedSteps[Math.floor(sortedSteps.length / 2)] || 0;
   const filteredGlitches =
     medianStep > 100_000 ? rows.filter((r) => r.step > 10_000) : rows;
 
-  // Walk backward from the latest row to keep only the canonical forward trajectory
   const keptReverse: MetricRow[] = [];
   let minStepSeen = Infinity;
   let retriesRemoved = 0;
@@ -159,7 +157,6 @@ function buildPhaseDiagnostics(phase: number, rawRows: MetricRow[]): PhaseDiagno
       maxLossStep = r.step;
     }
 
-    // Detect manual Epsilon bumps ("Adrenaline Spikes")
     if (i > 0) {
       const prevEps = targetRows[i - 1].epsilon;
       if (r.epsilon - prevEps >= 0.08) {
@@ -179,7 +176,6 @@ function buildPhaseDiagnostics(phase: number, rawRows: MetricRow[]): PhaseDiagno
   const startEpsilon = targetRows[0]?.epsilon ?? 1.0;
   const endEpsilon = targetRows[targetRows.length - 1]?.epsilon ?? 0.05;
 
-  // Build plain-English written analysis
   const spanStr = `${(startStep / 1000).toFixed(1)}k to ${(endStep / 1000).toFixed(1)}k steps (+${(
     totalStepsInPhase / 1000
   ).toFixed(1)}k steps)`;
@@ -190,7 +186,7 @@ function buildPhaseDiagnostics(phase: number, rawRows: MetricRow[]): PhaseDiagno
           adrenalineSpikes.length > 1 ? "s" : ""
         } (Epsilon resets up to ${(
           Math.max(...adrenalineSpikes.map((s) => s.to)) * 100
-        ).toFixed(0)}%) to break Manny out of shadow-freezing and force exploration around new pillar/guard timings.`
+        ).toFixed(0)}%) to break Manny out of shadow-freezing and force exploration around new pillar and guard timings.`
       : `Epsilon decayed smoothly from ${(startEpsilon * 100).toFixed(1)}% down to ${(
           endEpsilon * 100
         ).toFixed(1)}% without requiring manual exploration overrides.`;
@@ -209,7 +205,7 @@ function buildPhaseDiagnostics(phase: number, rawRows: MetricRow[]): PhaseDiagno
       1
     )}k, followed by a late-phase dip to ${finalWinRate.toFixed(
       1
-    )}% after a layout/curriculum adjustment forced policy rewiring.`;
+    )}% after a layout or curriculum adjustment forced policy rewiring.`;
   } else {
     statusText = `High-difficulty obstacle zone: peaked at ${peakWinRate.toFixed(
       1
@@ -268,7 +264,6 @@ export default function Dashboard() {
     return () => clearInterval(interval);
   }, []);
 
-  // Compute global and per-phase diagnostics
   const { phaseDiagnostics, globalStats } = useMemo(() => {
     const grouped = data.reduce((acc, row) => {
       if (!acc[row.phase]) acc[row.phase] = [];
@@ -313,22 +308,19 @@ export default function Dashboard() {
       className="min-h-screen bg-black text-zinc-100 p-4 md:p-8 font-sans selection:bg-emerald-500/30"
     >
       <div className="max-w-7xl mx-auto space-y-8">
-        {/* ============================================================ */}
-        {/* 1. HEADER & CONTROLS                                         */}
-        {/* ============================================================ */}
+        {/* 1. HEADER & CONTROLS */}
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-zinc-900 pb-6">
           <div>
             <div className="flex items-center gap-3">
-              <span className="h-3 w-3 rounded-full bg-emerald-400 animate-pulse shadow-[0_0_12px_#34d399]" />
               <h1 className="text-2xl md:text-3xl font-bold tracking-tight text-emerald-400">
                 Manny Telemetry
               </h1>
-              <span className="text-xs font-mono uppercase px-2.5 py-0.5 rounded-full bg-zinc-900 border border-zinc-800 text-zinc-400">
+              <span className="text-xs font-mono uppercase px-2.5 py-0.5 rounded bg-zinc-900 border border-zinc-800 text-zinc-400">
                 UE5 + PyTorch DQN
               </span>
             </div>
             <p className="text-zinc-400 mt-1 text-sm">
-              Multimodal Sensor Fusion (4-Frame CNN + 80-Ray LiDAR) • Curriculum Stealth Agent
+              Multimodal Sensor Fusion (4-Frame CNN + 80-Ray LiDAR) | Curriculum Stealth Agent
             </p>
           </div>
 
@@ -341,7 +333,7 @@ export default function Dashboard() {
                   : "bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-zinc-200"
               }`}
             >
-              {cleanMode ? "✨ Graph Mode: Untangled (Clean)" : "📈 Graph Mode: Raw Chronological"}
+              {cleanMode ? "Graph Mode: Untangled (Clean)" : "Graph Mode: Raw Chronological"}
             </button>
 
             {lastUpdated && (
@@ -352,9 +344,7 @@ export default function Dashboard() {
           </div>
         </div>
 
-        {/* ============================================================ */}
-        {/* 2. GLOBAL KPI BENTO GRID                                     */}
-        {/* ============================================================ */}
+        {/* 2. GLOBAL KPI BENTO GRID */}
         <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
           <div className="bg-zinc-950 border border-zinc-900 rounded-xl p-4">
             <p className="text-xs text-zinc-500 uppercase font-mono">Total Steps</p>
@@ -397,12 +387,12 @@ export default function Dashboard() {
           </div>
 
           <div className="bg-zinc-950 border border-zinc-900 rounded-xl p-4">
-            <p className="text-xs text-zinc-500 uppercase font-mono">Exploration (ε)</p>
+            <p className="text-xs text-zinc-500 uppercase font-mono">Exploration (Eps)</p>
             <p className="text-xl md:text-2xl font-bold text-pink-400 mt-1">
               {(globalStats.currentEpsilon * 100).toFixed(1)}%
             </p>
             <p className="text-[11px] text-zinc-500 mt-0.5">
-              ε = {globalStats.currentEpsilon.toFixed(3)}
+              Eps = {globalStats.currentEpsilon.toFixed(3)}
             </p>
           </div>
 
@@ -417,30 +407,26 @@ export default function Dashboard() {
           </div>
         </div>
 
-        {/* ============================================================ */}
-        {/* 3. SYSTEM ARCHITECTURE SPEC BAR                              */}
-        {/* ============================================================ */}
+        {/* 3. SYSTEM ARCHITECTURE SPEC BAR */}
         <div className="bg-zinc-950/90 border border-zinc-900 rounded-xl p-4 flex flex-wrap items-center justify-between gap-4 text-xs text-zinc-400">
           <div className="flex flex-wrap items-center gap-2">
             <span className="text-zinc-200 font-semibold">Brain Architecture:</span>
             <span className="px-2 py-1 rounded bg-zinc-900 border border-zinc-800">
-              Head A: 3-Layer CNN (4×128×128 Grayscale Stack)
+              Head A: 3-Layer CNN (4x128x128 Grayscale Stack)
             </span>
             <span className="px-2 py-1 rounded bg-zinc-900 border border-zinc-800">
               Head B: 2-Layer MLP (80 LiDAR Rays)
             </span>
             <span className="px-2 py-1 rounded bg-zinc-900 border border-zinc-800">
-              Fusion Core: 256-Unit Dense → 5 Discrete Actions
+              Fusion Core: 256-Unit Dense to 5 Discrete Actions
             </span>
           </div>
           <div className="font-mono text-zinc-500">
-            Replay Buffer: 40,000 | Batch: 32 | γ: 0.99
+            Replay Buffer: 40,000 | Batch: 32 | Gamma: 0.99
           </div>
         </div>
 
-        {/* ============================================================ */}
-        {/* 4. PER-PHASE GRAPHS + WRITTEN INTELLIGENCE LOGS              */}
-        {/* ============================================================ */}
+        {/* 4. PER-PHASE GRAPHS + WRITTEN INTELLIGENCE LOGS */}
         <div className="space-y-10">
           {phaseDiagnostics.length === 0 ? (
             <div className="bg-zinc-950 border border-zinc-900 rounded-xl p-12 text-center text-zinc-500 italic">
@@ -465,14 +451,14 @@ export default function Dashboard() {
                         <h2 className="text-lg md:text-xl font-bold text-blue-400">
                           Phase {diag.phase} Performance
                         </h2>
-                        <span className="text-xs px-2.5 py-0.5 rounded-full bg-blue-950/60 border border-blue-800/50 text-blue-300 font-mono">
-                          {(diag.startStep / 1000).toFixed(1)}k → {(diag.endStep / 1000).toFixed(1)}k steps
+                        <span className="text-xs px-2.5 py-0.5 rounded bg-blue-950/60 border border-blue-800/50 text-blue-300 font-mono">
+                          {(diag.startStep / 1000).toFixed(1)}k to {(diag.endStep / 1000).toFixed(1)}k steps
                         </span>
                       </div>
                       <p className="text-xs text-zinc-500 mt-1">
-                        Active Time: <span className="text-zinc-300 font-medium">{diag.activeTimeFormatted}</span> •
-                        Peak Win Rate: <span className="text-emerald-400 font-medium">{diag.peakWinRate.toFixed(1)}%</span> •
-                        Adrenaline Spikes: <span className="text-pink-400 font-medium">{diag.adrenalineSpikes.length}</span>
+                        Active Time: <span className="text-zinc-300 font-medium">{diag.activeTimeFormatted}</span> |
+                        Peak Win Rate: <span className="text-emerald-400 font-medium"> {diag.peakWinRate.toFixed(1)}%</span> |
+                        Adrenaline Spikes: <span className="text-pink-400 font-medium"> {diag.adrenalineSpikes.length}</span>
                       </p>
                     </div>
 
@@ -489,15 +475,11 @@ export default function Dashboard() {
                     <div className="lg:col-span-2 bg-black/60 border border-zinc-900 rounded-xl p-4">
                       <div className="flex items-center justify-between mb-3">
                         <span className="text-xs font-semibold uppercase tracking-wider text-zinc-400">
-                          Win Rate (%) vs. Exploration Epsilon (ε)
+                          Win Rate (%) vs. Exploration Epsilon
                         </span>
-                        <div className="flex items-center gap-4 text-xs">
-                          <span className="flex items-center gap-1.5 text-emerald-400">
-                            <span className="h-2 w-2 rounded-full bg-emerald-400" /> Win Rate
-                          </span>
-                          <span className="flex items-center gap-1.5 text-pink-400">
-                            <span className="h-2 w-2 rounded-full bg-pink-400" /> Epsilon
-                          </span>
+                        <div className="flex items-center gap-4 text-xs font-mono">
+                          <span className="text-emerald-400">[Win Rate]</span>
+                          <span className="text-pink-400">[Epsilon]</span>
                         </div>
                       </div>
 
@@ -552,7 +534,7 @@ export default function Dashboard() {
                               stroke="#f472b6"
                               strokeWidth={2}
                               dot={false}
-                              name="Epsilon (ε)"
+                              name="Epsilon"
                             />
                           </LineChart>
                         </ResponsiveContainer>
@@ -608,25 +590,21 @@ export default function Dashboard() {
                     </div>
                   </div>
 
-                  {/* ============================================================ */}
-                  {/* WRITTEN ANALYSIS BELOW GRAPH ("PHASE INTELLIGENCE LOG")      */}
-                  {/* ============================================================ */}
+                  {/* WRITTEN ANALYSIS BELOW GRAPH */}
                   <div className="bg-zinc-900/40 border border-zinc-800/80 rounded-xl p-4 space-y-3">
                     <div className="flex items-center justify-between">
                       <h3 className="text-xs font-bold uppercase tracking-wider text-emerald-400">
-                        📝 Phase {diag.phase} Written Intelligence Breakdown
+                        Phase {diag.phase} Written Intelligence Breakdown
                       </h3>
                       <span className="text-[11px] font-mono text-zinc-500">
                         {diag.cleanRows.length} clean checkpoints analyzed
                       </span>
                     </div>
 
-                    {/* Auto-Generated Written Paragraph */}
                     <p className="text-sm text-zinc-300 leading-relaxed">
                       {diag.narrative}
                     </p>
 
-                    {/* Structured Bullet Metrics */}
                     <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-2 border-t border-zinc-800/60 text-xs">
                       <div>
                         <span className="text-zinc-500 block">Step Span</span>
@@ -637,13 +615,13 @@ export default function Dashboard() {
                       <div>
                         <span className="text-zinc-500 block">Win Rate Trajectory</span>
                         <span className="text-zinc-200 font-mono">
-                          Peak {diag.peakWinRate.toFixed(1)}% → Final {diag.finalWinRate.toFixed(1)}%
+                          Peak {diag.peakWinRate.toFixed(1)}% to Final {diag.finalWinRate.toFixed(1)}%
                         </span>
                       </div>
                       <div>
                         <span className="text-zinc-500 block">Exploration Decay</span>
                         <span className="text-zinc-200 font-mono">
-                          ε {diag.startEpsilon.toFixed(2)} → {diag.endEpsilon.toFixed(2)} ({diag.adrenalineSpikes.length} spikes)
+                          Eps {diag.startEpsilon.toFixed(2)} to {diag.endEpsilon.toFixed(2)} ({diag.adrenalineSpikes.length} spikes)
                         </span>
                       </div>
                       <div>
