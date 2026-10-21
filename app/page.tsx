@@ -240,10 +240,101 @@ function buildPhaseDiagnostics(phase: number, rawRows: MetricRow[]): PhaseDiagno
   };
 }
 
+// Accepts a raw YouTube video ID or common YouTube video/live URLs.
+function extractYouTubeVideoId(value: string): string {
+  const input = value.trim();
+  if (!input) return "";
+
+  // A direct YouTube video ID is normally 11 characters.
+  if (/^[A-Za-z0-9_-]{11}$/.test(input)) return input;
+
+  try {
+    const normalized = /^[a-zA-Z][a-zA-Z\d+.-]*:\/\//.test(input)
+      ? input
+      : `https://${input}`;
+    const url = new URL(normalized);
+    const host = url.hostname.toLowerCase().replace(/^(www|m)\./, "");
+    const parts = url.pathname.split("/").filter(Boolean);
+    let candidate = "";
+
+    if (host === "youtu.be") {
+      candidate = parts[0] ?? "";
+    } else if (
+      host === "youtube.com" ||
+      host === "youtube-nocookie.com" ||
+      host === "studio.youtube.com"
+    ) {
+      candidate = url.searchParams.get("v") ?? "";
+
+      if (!candidate) {
+        const videoRoute = parts.findIndex((part) =>
+          ["live", "embed", "shorts", "v"].includes(part.toLowerCase())
+        );
+        if (videoRoute >= 0) candidate = parts[videoRoute + 1] ?? "";
+      }
+
+      // Also support YouTube Studio URLs such as /video/VIDEO_ID/livestreaming.
+      if (!candidate) {
+        const videoRoute = parts.findIndex((part) => part.toLowerCase() === "video");
+        if (videoRoute >= 0) candidate = parts[videoRoute + 1] ?? "";
+      }
+    }
+
+    return /^[A-Za-z0-9_-]{11}$/.test(candidate) ? candidate : "";
+  } catch {
+    return "";
+  }
+}
+
 export default function Dashboard() {
   const [data, setData] = useState<MetricRow[]>([]);
   const [cleanMode, setCleanMode] = useState<boolean>(true);
   const [lastUpdated, setLastUpdated] = useState<string>("");
+
+  // YouTube stream panel state. The saved ID is local to this browser.
+  const [streamId, setStreamId] = useState<string>(
+    process.env.NEXT_PUBLIC_YOUTUBE_STREAM_ID || ""
+  );
+  const [streamInput, setStreamInput] = useState<string>(
+    process.env.NEXT_PUBLIC_YOUTUBE_STREAM_ID || ""
+  );
+  const [showStream, setShowStream] = useState<boolean>(true);
+  const [streamError, setStreamError] = useState<string>("");
+
+  useEffect(() => {
+    try {
+      const savedId = window.localStorage.getItem("manny_stream_id");
+      if (savedId) {
+        setStreamId(savedId);
+        setStreamInput(savedId);
+      }
+    } catch {
+      // localStorage can be unavailable in some browser/privacy contexts.
+    }
+  }, []);
+
+  const handleSaveStreamId = () => {
+    const cleanId = extractYouTubeVideoId(streamInput);
+
+    if (!cleanId) {
+      setStreamError(
+        "Enter an 11-character YouTube video ID or a valid YouTube watch/live URL."
+      );
+      return;
+    }
+
+    setStreamId(cleanId);
+    setStreamInput(cleanId);
+    setStreamError("");
+
+    try {
+      window.localStorage.setItem("manny_stream_id", cleanId);
+    } catch {
+      setStreamError(
+        "Stream loaded, but this browser did not allow saving it for next time."
+      );
+    }
+  };
 
   useEffect(() => {
     const fetchData = async () => {
@@ -343,6 +434,81 @@ export default function Dashboard() {
             )}
           </div>
         </div>
+
+        {/* LIVE ARENA & CNN FUSION STREAM */}
+        <section className="bg-zinc-950 border border-zinc-900 rounded-2xl p-5 shadow-2xl space-y-4">
+          <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 border-b border-zinc-900 pb-4">
+            <div>
+              <h2 className="text-lg font-bold text-emerald-400">
+                Live Arena &amp; CNN Sensor Fusion Feed
+              </h2>
+              <p className="text-xs text-zinc-500 mt-1">
+                UE5 spectator feed streamed through OBS · YouTube Live DVR (when enabled)
+              </p>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <input
+                type="text"
+                value={streamInput}
+                onChange={(event) => {
+                  setStreamInput(event.target.value);
+                  if (streamError) setStreamError("");
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") handleSaveStreamId();
+                }}
+                placeholder="Paste YouTube Live URL or video ID"
+                aria-label="YouTube video URL or ID"
+                className="bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2 text-xs text-zinc-200 font-mono focus:outline-none focus:border-emerald-500 w-full sm:w-64"
+              />
+              <button
+                type="button"
+                onClick={handleSaveStreamId}
+                className="px-3 py-2 rounded-lg text-xs font-medium bg-emerald-950/80 border border-emerald-500/40 text-emerald-300 hover:bg-emerald-900/60 transition-all"
+              >
+                Load Stream
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowStream((visible) => !visible)}
+                aria-expanded={showStream}
+                className="px-3 py-2 rounded-lg text-xs font-medium bg-zinc-900 border border-zinc-800 text-zinc-400 hover:text-zinc-200 transition-all"
+              >
+                {showStream ? "Hide Feed" : "Show Feed"}
+              </button>
+            </div>
+          </div>
+
+          {streamError && (
+            <p role="alert" className="text-xs text-amber-300">
+              {streamError}
+            </p>
+          )}
+
+          {showStream && (
+            <div className="relative w-full aspect-video bg-black rounded-xl overflow-hidden border border-zinc-900 flex items-center justify-center">
+              {streamId ? (
+                <iframe
+                  key={streamId}
+                  src={`https://www.youtube.com/embed/${streamId}?autoplay=1&mute=1&playsinline=1`}
+                  title="Unreal Engine RL live arena stream"
+                  className="absolute inset-0 h-full w-full border-0"
+                  allow="autoplay; encrypted-media; picture-in-picture; fullscreen"
+                  referrerPolicy="strict-origin-when-cross-origin"
+                  allowFullScreen
+                />
+              ) : (
+                <div className="px-4 text-center">
+                  <p className="text-sm text-zinc-400">No stream loaded</p>
+                  <p className="text-xs text-zinc-600 mt-1">
+                    Paste the YouTube live/watch URL or video ID above. The stream must be live or available to this viewer.
+                  </p>
+                </div>
+              )}
+            </div>
+          )}
+        </section>
 
         {/* 2. GLOBAL KPI BENTO GRID */}
         <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
